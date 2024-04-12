@@ -43,6 +43,8 @@ extern "C"
 
 #include <peci.h>
 #endif
+#include "piromA.hpp"
+#include "pirom9.hpp"
 
 #include <phosphor-logging/log.hpp>
 #include <sdbusplus/asio/object_server.hpp>
@@ -272,16 +274,39 @@ static void
     auto cpuInfo = cpuInfoIt->second;
 
     if (tryReadPIROMWithCallback(cpuInfo, [cpuInfo](std::vector<std::byte> rom) {
-        std::optional<std::string> newSSpec = readSSpec(rom);
-        logStream(cpuInfo->id) << "SSpec read status: "
-                               << static_cast<bool>(newSSpec) << "\n";
-        if (newSSpec && newSSpec != cpuInfo->sSpec)
+        auto *pirom = std::make_unique<pirom::PIROM>(rom);
+        if (pirom->DataFormatRevision() == 0xA)
         {
-            cpuInfo->sSpec = newSSpec;
-            setCpuProperty(conn, cpuInfo->id, assetInterfaceName, "Model",
-                           *newSSpec);
+            pirom = std::make_unique<pirom::PIROMA>(rom);
+        }
+        else if (pirom->DataFormatRevision() == 0x9)
+        {
+            pirom = std::make_unique<pirom::PIROM9>(rom);
+        }
+        else
+        {
+            logStream(cpuInfo->id) << "Unsupported PIROM version" << pirom->DataFormatRevision() << " detected\n";
+            std::optional<std::string> newSSpec = readSSpec(rom);
+            logStream(cpuInfo->id) << "SSpec read status: "
+                                   << static_cast<bool>(newSSpec) << "\n";
+            if (newSSpec && newSSpec != cpuInfo->sSpec)
+            {
+                cpuInfo->sSpec = newSSpec;
+                setCpuProperty(conn, cpuInfo->id, assetInterfaceName, "Model",
+                               *newSSpec);
+            }
             return;
         }
+        logStream(cpuInfo->id) << "Found supported PIROM version" << pirom->DataFormatRevision() << "\n";
+        if (pirom->Sspec())
+        {
+            setCpuProperty(conn, cpuInfo->id, assetInterfaceName, "Model", pirom->Sspec());
+        }
+        if (pirom->FamilyNumber())
+        {
+            setCpuProperty(conn, cpuInfo->id, assetInterfaceName, "Family", pirom->FamilyNumber());
+        }
+
         })
     {
         return;
