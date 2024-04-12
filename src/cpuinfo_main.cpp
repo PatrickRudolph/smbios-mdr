@@ -100,8 +100,8 @@ static void
 static void createCpuUpdatedMatch(
     const std::shared_ptr<sdbusplus::asio::connection>& conn, size_t cpu);
 
-static std::optional<std::string> readSSpec(uint8_t bus, uint8_t slaveAddr,
-                                            uint8_t regAddr, size_t count)
+static std::optional<std::string> readPIROM(uint8_t bus, uint8_t slaveAddr,
+                                            uint8_t regAddr)
 {
     unsigned long funcs = 0;
     std::string devPath = "/dev/i2c-" + std::to_string(bus);
@@ -187,6 +187,71 @@ static std::optional<std::string> readSSpec(uint8_t bus, uint8_t slaveAddr,
     return sspec;
 }
 
+
+/**
+ * Low level PIROM logic.
+ * This handles retrying the PIROM reads until two subsequent reads are
+ * successful and return matching data. When we have confidence that the data
+ * read is correct, then invokes the callback.
+ *
+ * @param[in]       cpuInfo     CPU to read from.
+ * @param[in]       callback    Function to call on success
+ */
+static bool tryReadPIROMWithCallback(const std::shared_ptr<cpu_info::CPUInfo>& cpuInfo,
+                                     std::function<void(std::vector<std::byte>)>&& callback)
+{
+    static int failedReads = 0;
+    std::vector<std::byte> rom;
+    std::vector<std::byte> copy;
+
+    if (readPIROM(cpuInfo->i2cBus, cpuInfo->i2cDevice, rom, defaultPIROMSize))
+    {
+        if (readPIROM(cpuInfo->i2cBus, cpuInfo->i2cDevice, copy, defaultPIROMSize))
+        {
+            if (std::equal(copy.begin(), copy.end(), rom.begin()))
+            {
+                callback(rom);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static std::optional<std::string> readSSpec(const std::vector<std::byte> rom)
+{
+
+    int value = 0;
+    std::string sspec;
+    sspec.reserve(sspecSize);
+
+    for (size_t i = 0; i < sspecSize; i++)
+    {
+        value = rom.At(sspecRegAddr + i);
+        if (!std::isprint(static_cast<unsigned char>(value)))
+        {
+            phosphor::logging::log<phosphor::logging::level::ERR>(
+                "Non printable value in sspec, ignored.");
+            continue;
+        }
+        // sspec always starts with S,
+        // if not assume it is QDF string which starts at offset 2
+        if (i == 0 && static_cast<unsigned char>(value) != 'S')
+        {
+            i = 1;
+            continue;
+        }
+        sspec.push_back(static_cast<unsigned char>(value));
+    }
+
+    if (sspec.size() < 4)
+    {
+        return std::nullopt;
+    }
+
+    return sspec;
+}
+
 /**
  * Higher level SSpec logic.
  * This handles retrying the PIROM reads until two subsequent reads are
@@ -206,40 +271,30 @@ static void
     }
     auto cpuInfo = cpuInfoIt->second;
 
-    std::optional<std::string> newSSpec =
-        readSSpec(cpuInfo->i2cBus, cpuInfo->i2cDevice, sspecRegAddr, sspecSize);
-    logStream(cpuInfo->id) << "SSpec read status: "
-                           << static_cast<bool>(newSSpec) << "\n";
-    if (newSSpec && newSSpec == cpuInfo->sSpec)
+    if (tryReadPIROMWithCallback(cpuInfo, [cpuInfo](std::vector<std::byte> rom) {
+        std::optional<std::string> newSSpec = readSSpec(rom);
+        logStream(cpuInfo->id) << "SSpec read status: "
+                               << static_cast<bool>(newSSpec) << "\n";
+        if (newSSpec && newSSpec != cpuInfo->sSpec)
+        {
+            cpuInfo->sSpec = newSSpec;
+            setCpuProperty(conn, cpuInfo->id, assetInterfaceName, "Model",
+                           *newSSpec);
+            return;
+        }
+        })
     {
-        setCpuProperty(conn, cpuInfo->id, assetInterfaceName, "Model",
-                       *newSSpec);
         return;
     }
 
-    // If this read failed, back off for a little longer so that hopefully the
-    // transient condition affecting PIROM reads will pass, but give up after
-    // several consecutive failures. But if this read looked OK, try again
-    // sooner to confirm it.
-    int retrySeconds;
-    if (newSSpec)
+    if (++failedReads > 10)
     {
-        retrySeconds = 1;
-        failedReads = 0;
-        cpuInfo->sSpec = *newSSpec;
-    }
-    else
-    {
-        retrySeconds = 5;
-        if (++failedReads > 10)
-        {
-            logStream(cpuInfo->id) << "PIROM Read failed too many times\n";
-            return;
-        }
+        logStream(cpuInfo->id) << "PIROM Read failed too many times\n";
+        return;
     }
 
     auto sspecTimer = std::make_shared<boost::asio::steady_timer>(
-        conn->get_io_context(), std::chrono::seconds(retrySeconds));
+        conn->get_io_context(), std::chrono::seconds(5));
     sspecTimer->async_wait(
         [sspecTimer, conn, cpuIndex](boost::system::error_code ec) {
         if (ec)
