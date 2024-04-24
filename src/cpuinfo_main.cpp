@@ -63,6 +63,8 @@ static constexpr uint8_t defaultI2cBus = 13;
 static constexpr uint8_t defaultI2cSlaveAddr0 = 0x50;
 static constexpr uint8_t sspecRegAddr = 0xd;
 static constexpr uint8_t sspecSize = 6;
+static constexpr uint8_t PIROMSize = 128;
+static constexpr uint8_t defaultPIROMSize = 128;
 
 using CPUInfoMap = boost::container::flat_map<size_t, std::shared_ptr<CPUInfo>>;
 
@@ -102,8 +104,8 @@ static void
 static void createCpuUpdatedMatch(
     const std::shared_ptr<sdbusplus::asio::connection>& conn, size_t cpu);
 
-static std::optional<std::string> readPIROM(uint8_t bus, uint8_t slaveAddr,
-                                            uint8_t regAddr)
+static bool readPIROM(uint8_t bus, uint8_t slaveAddr,
+                      std::vector<std::byte>& rom, size_t count)
 {
     unsigned long funcs = 0;
     std::string devPath = "/dev/i2c-" + std::to_string(bus);
@@ -115,7 +117,7 @@ static std::optional<std::string> readPIROM(uint8_t bus, uint8_t slaveAddr,
             "Error in open!",
             phosphor::logging::entry("PATH=%s", devPath.c_str()),
             phosphor::logging::entry("SLAVEADDR=0x%x", slaveAddr));
-        return std::nullopt;
+        return false;
     }
 
     if (::ioctl(fd, I2C_FUNCS, &funcs) < 0)
@@ -125,7 +127,7 @@ static std::optional<std::string> readPIROM(uint8_t bus, uint8_t slaveAddr,
             phosphor::logging::entry("PATH=%s", devPath.c_str()),
             phosphor::logging::entry("SLAVEADDR=0x%x", slaveAddr));
         ::close(fd);
-        return std::nullopt;
+        return false;
     }
 
     if (!(funcs & I2C_FUNC_SMBUS_READ_BYTE_DATA))
@@ -135,7 +137,7 @@ static std::optional<std::string> readPIROM(uint8_t bus, uint8_t slaveAddr,
             phosphor::logging::entry("PATH=%s", devPath.c_str()),
             phosphor::logging::entry("SLAVEADDR=0x%x", slaveAddr));
         ::close(fd);
-        return std::nullopt;
+        return false;
     }
 
     if (::ioctl(fd, I2C_SLAVE_FORCE, slaveAddr) < 0)
@@ -145,16 +147,14 @@ static std::optional<std::string> readPIROM(uint8_t bus, uint8_t slaveAddr,
             phosphor::logging::entry("PATH=%s", devPath.c_str()),
             phosphor::logging::entry("SLAVEADDR=0x%x", slaveAddr));
         ::close(fd);
-        return std::nullopt;
+        return false;
     }
 
-    int value = 0;
-    std::string sspec;
-    sspec.reserve(count);
+    rom.reserve(count);
 
     for (size_t i = 0; i < count; i++)
     {
-        value = ::i2c_smbus_read_byte_data(fd, regAddr + i);
+        int value = ::i2c_smbus_read_byte_data(fd, i);
         if (value < 0)
         {
             phosphor::logging::log<phosphor::logging::level::ERR>(
@@ -162,31 +162,13 @@ static std::optional<std::string> readPIROM(uint8_t bus, uint8_t slaveAddr,
                 phosphor::logging::entry("PATH=%s", devPath.c_str()),
                 phosphor::logging::entry("SLAVEADDR=0x%x", slaveAddr));
             ::close(fd);
-            return std::nullopt;
+            return false;
         }
-        if (!std::isprint(static_cast<unsigned char>(value)))
-        {
-            phosphor::logging::log<phosphor::logging::level::ERR>(
-                "Non printable value in sspec, ignored.");
-            continue;
-        }
-        // sspec always starts with S,
-        // if not assume it is QDF string which starts at offset 2
-        if (i == 0 && static_cast<unsigned char>(value) != 'S')
-        {
-            i = 1;
-            continue;
-        }
-        sspec.push_back(static_cast<unsigned char>(value));
+        rom.push_back(static_cast<std::byte>(value));
     }
     ::close(fd);
 
-    if (sspec.size() < 4)
-    {
-        return std::nullopt;
-    }
-
-    return sspec;
+    return true;
 }
 
 
@@ -202,7 +184,6 @@ static std::optional<std::string> readPIROM(uint8_t bus, uint8_t slaveAddr,
 static bool tryReadPIROMWithCallback(const std::shared_ptr<cpu_info::CPUInfo>& cpuInfo,
                                      std::function<void(std::vector<std::byte>)>&& callback)
 {
-    static int failedReads = 0;
     std::vector<std::byte> rom;
     std::vector<std::byte> copy;
 
@@ -229,7 +210,7 @@ static std::optional<std::string> readSSpec(const std::vector<std::byte> rom)
 
     for (size_t i = 0; i < sspecSize; i++)
     {
-        value = rom.At(sspecRegAddr + i);
+        value = rom.at(sspecRegAddr + i);
         if (!std::isprint(static_cast<unsigned char>(value)))
         {
             phosphor::logging::log<phosphor::logging::level::ERR>(
@@ -273,15 +254,15 @@ static void
     }
     auto cpuInfo = cpuInfoIt->second;
 
-    if (tryReadPIROMWithCallback(cpuInfo, [cpuInfo](std::vector<std::byte> rom) {
+    if (tryReadPIROMWithCallback(cpuInfo, [cpuInfo, conn](std::vector<std::byte> rom) {
         auto *pirom = std::make_unique<pirom::PIROM>(rom);
         if (pirom->DataFormatRevision() == 0xA)
         {
-            pirom = std::make_unique<pirom::PIROMA>(rom);
+            pirom = std::make_unique<pirom::PIROMA::PIROMA>(rom);
         }
         else if (pirom->DataFormatRevision() == 0x9)
         {
-            pirom = std::make_unique<pirom::PIROM9>(rom);
+            pirom = std::make_unique<pirom::PIROM9::PIROM9>(rom);
         }
         else
         {
@@ -307,7 +288,7 @@ static void
             setCpuProperty(conn, cpuInfo->id, assetInterfaceName, "Family", pirom->FamilyNumber());
         }
 
-        })
+        }))
     {
         return;
     }

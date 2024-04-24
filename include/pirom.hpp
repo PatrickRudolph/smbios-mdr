@@ -26,12 +26,23 @@ namespace pirom
 class PIROM
 {
   public:
-    PIROM(std::vector<std::byte> pirom) : rom(pirom)
+    static PIROM PIROMFabric(std::vector<std::byte>& pirom)
+    {
+        PIROM pirom(pirom);
+        switch(pirom.DataFormatRevision()) {
+            case 9:
+                return new PIROM9(pirom);
+            default:
+        }
+        return nullptr;
+    }
+
+    PIROM(std::vector<std::byte>& pirom) : rom(pirom)
     {
     }
 
-    size_t DataFormatRevision() {
-        return rom.at(0);
+    uint8_t DataFormatRevision() {
+        return std::to_integer<uint8_t>(rom.at(0));
     }
 
     virtual std::optional<uint16_t> Size() { return std::nullopt; }
@@ -63,11 +74,11 @@ class PIROM
         std::string ret;
         for (size_t i = start; i < start + cnt; i++)
         {
-            if (!std::isprint(rom.at(i)))
+            if (!std::isprint(std::to_integer<uint8_t>(rom.at(i))))
             {
                 continue;
             }
-            ret.push_back(rom.At(i));
+            ret.push_back(std::to_integer<uint8_t>(rom.at(i)));
         }
         boost::algorithm::trim(ret);
         return ret;
@@ -75,15 +86,20 @@ class PIROM
 
     uint8_t ReadUInt8(size_t start)
     {
-        return boost::endian::little_to_native(rom.at(start));
+        return std::to_integer<uint8_t>(rom.at(start));
     }
 
     uint16_t ReadUInt16(size_t start)
     {
-        uint16_t data;
-        slice(start, sizeof(data), &data);
+        union {
+            uint16_t val;
+            uint8_t raw[2];
+        } tmp;
 
-        return boost::endian::little_to_native(data);
+        for (size_t i = 0; i < sizeof(tmp.val); i++)
+            tmp.raw[i] = ReadUInt8(start + i);
+
+        return boost::endian::little_to_native(tmp.val);
     }
 
     uint8_t ReadUInt8BCD(size_t start)
@@ -105,12 +121,17 @@ class PIROM
 
     uint64_t ReadUInt64(size_t start)
     {
-        uint64_t data;
-        slice(start, sizeof(data), &data);
-        return boost::endian::little_to_native(data);
+        union {
+            uint16_t val;
+            uint8_t raw[8];
+        } tmp;
+
+        for (size_t i = 0; i < sizeof(tmp.val); i++)
+            tmp.raw[i] = ReadUInt8(start + i);
+
+        return boost::endian::little_to_native(tmp.val);
     }
     private:
       std::vector<std::byte> rom;
 };
-
 }; // namespace pirom

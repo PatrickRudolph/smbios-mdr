@@ -239,7 +239,7 @@ class PIROM9 : public PIROM
                          offsetof(struct PIROMPPIN, PPIN));
     }
 
-    PIROMA(std::vector<std::byte>& raw) : PIROM(raw), header()
+    PIROM9(std::vector<std::byte>& raw) : PIROM(raw), header()
     {
         if (DataFormatRevision() != 0x9 || raw.size() < sizeof(header))
         {
